@@ -32,9 +32,7 @@ def tokenize_function(examples):
     return out_batch
 
 tokenized_datasets = llm_dataset.map(tokenize_function, batched=True)
-print(tokenized_datasets)
 tokenized_datasets = tokenized_datasets.remove_columns(["source"])
-print(tokenized_datasets)
 tokenized_datasets.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
 
 collate_fn = DataCollatorWithPadding(tokenizer=tokenizer)
