@@ -12,8 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 llm_data_files = {
-    "train": "data/train.jsonl",
-    "test": "data/test.jsonl",
+    "train": "data/alpaca_data.jsonl",
 }
 
 llm_dataset = load_dataset("json", data_files=llm_data_files)
@@ -28,19 +27,19 @@ tokenizer.add_tokens(special_tokens, special_tokens=True)
 
 def tokenize_function(examples):
     # 在使用tokenizer function的模式下，需要将labels设置为input_ids,默认情况下 是不存在labels 这样会导致loss为nan
-    out_batch = tokenizer(examples["input"], truncation=True, padding="max_length", max_length=max_length, return_tensors="pt")
+    out_batch = tokenizer(examples["source"], truncation=True, padding="max_length", max_length=max_length, return_tensors="pt")
     out_batch["labels"] = out_batch["input_ids"]
     return out_batch
 
 tokenized_datasets = llm_dataset.map(tokenize_function, batched=True)
-tokenized_datasets = tokenized_datasets.remove_columns(["input"])
+print(tokenized_datasets)
+tokenized_datasets = tokenized_datasets.remove_columns(["source"])
 print(tokenized_datasets)
 tokenized_datasets.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
 
 collate_fn = DataCollatorWithPadding(tokenizer=tokenizer)
 
 train_dataloader = DataLoader(tokenized_datasets["train"], shuffle=True, batch_size=8, collate_fn=collate_fn)
-eval_dataloader = DataLoader(tokenized_datasets["test"], batch_size=8, collate_fn=collate_fn)
 
 model = AutoModelForCausalLM.from_pretrained(checkpoints, torch_dtype=torch.bfloat16)
 model.resize_token_embeddings(len(tokenizer))
@@ -59,13 +58,12 @@ lr_scheduler = get_scheduler(
     num_training_steps=num_training_steps,
 )
 
-model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader, lr_scheduler)
+model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
 progress_bar = tqdm(range(num_training_steps))
 
 for epoch in range(num_epochs):
     model.train()
     for step, batch in enumerate(train_dataloader):
-        # batch = {k: v.to(accelerator.device) for k, v in batch.items()}
         outputs = model(**batch)
         loss = outputs.loss
         accelerator.backward(loss)
