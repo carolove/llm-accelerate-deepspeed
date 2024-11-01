@@ -8,17 +8,11 @@ from pathlib import Path
 import re
 import tempfile
 import time
-import tree
 from typing import Tuple
 
-try:
-    import deepspeed  # noqa: F401
-except ImportError as e:
-    raise RuntimeError(
-        "Please install deepspeed with `pip install --user deepspeed`."
-    ) from e
+from datasets import load_dataset
 
-from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate import Accelerator
 from accelerate.utils import DummyOptim, DummyScheduler, set_seed
 import torch
 import torch.nn as nn
@@ -27,21 +21,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     get_linear_schedule_with_warmup,
+    DataCollatorWithPadding,
 )
-
+from torch.utils.data import DataLoader
 from peft import LoraConfig, get_peft_model
-import ray
-from ray import train
-import ray.util.scheduling_strategies
-from ray.train.torch import TorchTrainer
-from ray.train import Checkpoint
-
-from utils import (
-    get_checkpoint_and_refs_dir,
-    get_mirror_link,
-    download_model,
-    get_download_path,
-)
 
 
 OPTIM_BETAS = (0.9, 0.999)
@@ -114,27 +97,8 @@ def get_number_of_params(model: nn.Module):
     return sum
 
 
-def collate_fn(batch, tokenizer, block_size, device):
-    out_batch = tokenizer(
-        list(batch["input"]),
-        padding="max_length",
-        max_length=block_size,
-        truncation=True,
-        return_tensors="pt",
-    )
-    out_batch["labels"] = out_batch["input_ids"].clone()
-
-    out_batch = tree.map_structure(lambda x: x.to(device), out_batch)
-
-    return out_batch
-
-
 def get_pretrained_path(model_id: str):
-    mirror_uri = get_mirror_link(model_id)
-    ckpt_path, _ = get_checkpoint_and_refs_dir(
-        model_id=model_id, bucket_uri=mirror_uri, s3_sync_args=["--no-sign-request"]
-    )
-    return ckpt_path
+    return "meta-llama/Llama-3.2-1B"
 
 
 def get_tokenizer(model_name, special_tokens):
@@ -149,13 +113,12 @@ def get_tokenizer(model_name, special_tokens):
 
 
 def evaluate(
-    *, model, eval_ds, accelerator, bsize, ds_kwargs, as_test: bool = False
+    *, model, eval_dataloader, accelerator, bsize, ds_kwargs, as_test: bool = False
 ) -> Tuple[float, float]:
     model.eval()
     losses = []
 
-    eval_dataloader = eval_ds.iter_torch_batches(batch_size=bsize, **ds_kwargs)
-    eval_ds_len = len(list(eval_ds.iter_batches(batch_size=1)))
+    eval_ds_len = len(eval_dataloader)
     for step, batch in tqdm.tqdm(
         enumerate(eval_dataloader), total=eval_ds_len // (bsize + 1)
     ):
@@ -216,32 +179,18 @@ def checkpoint_model(
     print(status_msg)
 
 
-def training_function(kwargs: dict):
+def training_function(args, config, special_tokens):
     print("training_function called")
 
+    # 暂时不需要这部分代码，尽管accelerate 的device 暂时只能用0
     # Train has a bug somewhere that causes ACCELERATE_TORCH_DEVICE to not be set
     # properly on multi-gpu nodes
-    cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device_id = cuda_visible_device[local_rank]
-    os.environ["ACCELERATE_TORCH_DEVICE"] = f"cuda:{device_id}"
+    # cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+    # local_rank = int(os.environ["LOCAL_RANK"])
+    # device_id = cuda_visible_device[local_rank]
+    # os.environ["ACCELERATE_TORCH_DEVICE"] = f"cuda:{device_id}"
 
-    config = kwargs["config"]
-    args = argparse.Namespace(**kwargs["args"])
-    special_tokens = kwargs.get("special_tokens", [])
     model_id = config["model_name"]
-
-    # We need to download the model weights on this machine if they don't exit.
-    # We need to acquire a lock to ensure that only one process downloads the model
-    bucket_uri = get_mirror_link(model_id)
-    download_path = get_download_path(model_id)
-    base_path = Path(download_path).parent
-    base_path.mkdir(parents=True, exist_ok=True)
-    lock_file = str(base_path / f'{model_id.replace("/",  "--")}.lock')
-    with FileLock(lock_file):
-        download_model(
-            model_id=model_id, bucket_uri=bucket_uri, s3_sync_args=["--no-sign-request"]
-        )
 
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
@@ -249,45 +198,43 @@ def training_function(kwargs: dict):
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
     gradient_accumulation_steps = int(config["gradient_accumulation_steps"])
-
-    # Get deepspeed config to setup the batch size per device
-    ds_plugin = config["ds_plugin"]
-    ds_plugin.hf_ds_config.config["train_micro_batch_size_per_gpu"] = batch_size
-
     # Initialize accelerator
     accelerator = Accelerator(
-        deepspeed_plugin=ds_plugin,
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=args.mx,
     )
 
     set_seed(seed)
 
-    # train_ds is the local shard for this model
-    train_ds = train.get_dataset_shard("train")
-    valid_ds = train.get_dataset_shard("valid")
-
-    train_ds_len = len(list(train_ds.iter_batches(batch_size=1)))
-
     _test_tokenizer(args.model_name)
     tokenizer = get_tokenizer(model_name=args.model_name, special_tokens=special_tokens)
-    collate_partial = functools.partial(
-        collate_fn,
-        tokenizer=tokenizer,
-        block_size=config["block_size"],
-        device=accelerator.device,
-    )
+    def tokenize_function(examples):
+        out_batch = tokenizer(examples["input"], padding="max_length", max_length=config["block_size"], truncation=True)
+        out_batch["labels"] = out_batch["input_ids"]
+        return out_batch
+    
+
+    data_files = config["data_files"]
+    # train_ds is the local shard for this model
+    datasets = load_dataset("json", data_files=data_files)
+    datasets = datasets.map(tokenize_function, batched=True)
+    datasets = datasets.remove_columns(["input"])
+    datasets.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+
+    collate_fn = DataCollatorWithPadding(tokenizer=tokenizer)
+    train_dataloader = DataLoader(datasets["train"], shuffle=True, batch_size=batch_size, collate_fn=collate_fn)
+    valid_dataloader = DataLoader(datasets["test"], shuffle=True, batch_size=config["eval_batch_size"], collate_fn=collate_fn)
+
+    train_ds_len = len(train_dataloader)
 
     pretrained_path = get_pretrained_path(model_id)
     print(f"Loading model from {pretrained_path} ...")
     s = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_path,
-        trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         # `use_cache=True` is incompatible with gradient checkpointing.
         use_cache=False,
-        use_flash_attention_2=True,
     )
     print(f"Done loading model in {time.time() - s} seconds.")
 
@@ -371,7 +318,7 @@ def training_function(kwargs: dict):
     # There is no specific order to remember, we just need to unpack the objects in the
     # same order we gave them to the prepare method.
     s = time.time()
-    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+    model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, valid_dataloader, lr_scheduler)
     print(f"Prepare done in {time.time() - s} seconds.")
 
     # Now we train the model
@@ -384,11 +331,6 @@ def training_function(kwargs: dict):
         s_epoch = time.time()
         model.train()
         loss_sum = torch.tensor(0.0).to(accelerator.device)
-
-        train_dataloader = train_ds.iter_torch_batches(
-            batch_size=batch_size,
-            collate_fn=collate_partial,
-        )
 
         for step, batch in tqdm.tqdm(
             enumerate(train_dataloader), total=train_ds_len // batch_size + 1
@@ -430,23 +372,23 @@ def training_function(kwargs: dict):
 
             # as long as this is not the last step report here
             if step != (train_ds_len // batch_size - 1):
-                train.report(
-                    {
-                        "epoch": epoch,
-                        "iteration": step,
-                        "train_loss_batch": aggregated_loss,
-                        "avg_train_loss_epoch": None,
-                        "eval_loss": None,
-                        "perplexity": None,
-                        "num_iterations": step + 1,
-                        "train_time_per_epoch": None,
-                        "eval_time_per_epoch": None,
-                        "fwd_time": fwd_time,
-                        "bwd_time": bwd_time,
-                        "avg_fwd_time_per_epoch": None,
-                        "avg_bwd_time_per_epoch": None,
-                        "learning_rate": lr_scheduler.get_lr()[0],
-                    }
+                print(
+                    f"[epoch {epoch} step {step}] "
+                    f"loss: {loss.item()} step-time: {e_opt_step - s_fwd}"
+                    f"epoch: {epoch}, "
+                    f"iteration: {step}, "
+                    f"train_loss_batch: {aggregated_loss}, "
+                    f"avg_train_loss_epoch: None, "
+                    f"eval_loss: None, "
+                    f"perplexity: None, "
+                    f"num_iterations: {step + 1}, "
+                    f"train_time_per_epoch: None, "
+                    f"eval_time_per_epoch: None, "
+                    f"fwd_time: {fwd_time}, "
+                    f"bwd_time: {bwd_time}, "
+                    f"avg_fwd_time_per_epoch: None, "
+                    f"avg_bwd_time_per_epoch: None, "
+                    f"learning_rate: {lr_scheduler.get_lr()[0]}, "
                 )
 
         e_epoch = time.time()
@@ -456,10 +398,9 @@ def training_function(kwargs: dict):
         print("Running evaluation ...")
         perplex, eloss = evaluate(
             model=model,
-            eval_ds=valid_ds,
+            eval_dataloader=valid_dataloader,
             accelerator=accelerator,
             bsize=config["eval_batch_size"],
-            ds_kwargs={"collate_fn": collate_partial},
             as_test=config["as_test"],
         )
         accelerator.print("Eval result loss", eloss)
@@ -471,22 +412,22 @@ def training_function(kwargs: dict):
         accelerator.print("avg bwd time: ", bwd_time_sum / (step + 1))
         accelerator.print("avg opt step time: ", optim_step_time_sum / (step + 1))
 
-        metrics = {
-            "epoch": epoch,
-            "iteration": step,
-            "train_loss_batch": aggregated_loss,
-            "avg_train_loss_epoch": loss_sum.item() / (step + 1),
-            "eval_loss": eloss,
-            "perplexity": perplex,
-            "num_iterations": step + 1,
-            "train_time_per_epoch": e_epoch - s_epoch,
-            "eval_time_per_epoch": eval_e_epoch - eval_s_epoch,
-            "fwd_time": fwd_time,
-            "bwd_time": bwd_time,
-            "avg_fwd_time_per_epoch": fwd_time_sum / (step + 1),
-            "avg_bwd_time_per_epoch": bwd_time_sum / (step + 1),
-            "learning_rate": lr_scheduler.get_lr()[0],
-        }
+        print(
+            f"epoch: {epoch}, "
+            f"iteration: {step}, "
+            f"train_loss_batch: {aggregated_loss}, "
+            f"avg_train_loss_epoch: {loss_sum.item() / (step + 1)}, "
+            f"eval_loss: {eloss}, "
+            f"perplexity: {perplex}, "
+            f"num_iterations: {step + 1}, "
+            f"train_time_per_epoch: {e_epoch - s_epoch}, "
+            f"eval_time_per_epoch: {eval_e_epoch - eval_s_epoch}, "
+            f"fwd_time: {fwd_time}, "
+            f"bwd_time: {bwd_time}, "
+            f"avg_fwd_time_per_epoch: {fwd_time_sum / (step + 1)}, "
+            f"avg_bwd_time_per_epoch: {bwd_time_sum / (step + 1)}, "
+            f"learning_rate: {lr_scheduler.get_lr()[0]}, "
+        )
 
         with tempfile.TemporaryDirectory(dir=args.output_dir) as temp_checkpoint_dir:
             accelerator.print(f"Saving the model locally at {temp_checkpoint_dir}")
@@ -514,7 +455,6 @@ def training_function(kwargs: dict):
             # )
 
             # Checkpointing strategy 2: Aggregate model on the rank 0 worker then upload
-            aggregate_on_rank_0 = True
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save_pretrained(
                 temp_checkpoint_dir,
@@ -527,24 +467,6 @@ def training_function(kwargs: dict):
             print("Checkpoint save time: ", time.perf_counter() - checkpoint_save_start)
 
             checkpoint_upload_start = time.perf_counter()
-
-            # Create the checkpoint object to report to Ray Train and upload to storage.
-            # If we aggregated the model on rank 0, we only need to report
-            # the checkpoint from the rank 0 worker, since all other checkpoint
-            # directories are empty (`save_pretrained` was a noop for other workers).
-            if aggregate_on_rank_0:
-                checkpoint = (
-                    Checkpoint.from_directory(temp_checkpoint_dir)
-                    if accelerator.is_main_process
-                    else None
-                )
-            else:
-                # Distributed checkpointing should upload shards from each worker.
-                checkpoint = Checkpoint.from_directory(temp_checkpoint_dir)
-
-            # Note: After `train.report`, in the case of remote storage,
-            # the checkpoint directory will be uploaded to the remote storage.
-            train.report(metrics, checkpoint=checkpoint)
 
             print(
                 "Checkpoint upload time: ",
@@ -640,7 +562,7 @@ def parse_args():
     parser.add_argument(
         "--ctx-len",
         type=int,
-        default=512,
+        default=128,
         help="Maximum context length for the model input sequences.",
     )
 
@@ -698,75 +620,19 @@ def main():
             lora_config = json.load(json_file)
         config["lora_config"] = lora_config
 
-    # Add deepspeed plugin to the config
-    ds_plugin = DeepSpeedPlugin(hf_ds_config=config.get("ds_config"))
-    config.update(ds_plugin=ds_plugin)
-
-    ray.init(
-        runtime_env={
-            "env_vars": {"HF_HOME": "/mnt/local_storage/.cache/huggingface"},
-            "working_dir": ".",
-        }
-    )
 
     # Read data
-    train_ds = ray.data.read_json(args.train_path)
-    if args.test_path is not None:
-        valid_ds = ray.data.read_json(args.test_path)
-    else:
-        valid_ds = None
+    data_files = {
+        "train": args.train_path,
+        "test": args.test_path,
+    }
+    config["data_files"] = data_files
 
     # json file
     with open(args.special_token_path, "r") as json_file:
         special_tokens = json.load(json_file)["tokens"]
 
-    assert (
-        "ANYSCALE_ARTIFACT_STORAGE" in os.environ
-    ), "ANYSCALE_ARTIFACT_STORAGE env var must be set!"
-    artifact_storage = os.environ["ANYSCALE_ARTIFACT_STORAGE"]
-    user_name = re.sub(r"\s+", "__", os.environ.get("ANYSCALE_USERNAME", "user"))
-    storage_path = (
-        f"{artifact_storage}/{user_name}/ft_llms_with_deepspeed/{args.model_name}"
-    )
-
-    trial_name = f"{args.model_name}".split("/")[-1]
-    if args.lora:
-        trial_name += "-lora"
-
-    trainer = TorchTrainer(
-        training_function,
-        train_loop_config={
-            "config": config,
-            "args": vars(args),
-            "special_tokens": special_tokens,
-        },
-        run_config=train.RunConfig(
-            storage_path=storage_path,
-            checkpoint_config=train.CheckpointConfig(
-                num_to_keep=args.num_checkpoints_to_keep,
-                checkpoint_score_attribute="perplexity",
-                checkpoint_score_order="min",
-            ),
-        ),
-        scaling_config=train.ScalingConfig(
-            num_workers=args.num_devices,
-            use_gpu=True,
-            resources_per_worker={"GPU": 1},
-        ),
-        datasets={"train": train_ds, "valid": valid_ds},
-        dataset_config=ray.train.DataConfig(datasets_to_split=["train", "valid"]),
-    )
-
-    result: train.Result = trainer.fit()
-    # `best_checkpoints` are sorted in increasing score order.
-    # (Ex: in this case, negative perplexity, since we set `checkpoint_score_order=min`)
-    best_checkpoint, best_checkpoint_metrics = result.best_checkpoints[-1]
-
-    print("Results are stored at:")
-    print(result.path)
-    print("Best checkpoint is stored at:")
-    print(best_checkpoint)
-    print(f"With perplexity: {best_checkpoint_metrics['perplexity']}")
+    training_function(args, config, special_tokens)
 
 
 if __name__ == "__main__":

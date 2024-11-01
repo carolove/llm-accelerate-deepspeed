@@ -25,12 +25,11 @@ fine_tune() {
     local token_path=$8
     local params=("${@:9}")
     echo "Fine-tuning model..."
-    if ! python finetune_hf_llm.py \
+    if ! accelerate launch finetune_hf_llm.py \
         -bs "${bs}" \
         -nd "${nd}" \
         --model_name "${model_name}" \
         --output_dir "${output_dir}" \
-        --ds-config "${ds_config}" \
         --train_path "${train_path}" \
         --test_path "${test_path}"  \
         --special_token_path "${token_path}" \
@@ -43,7 +42,7 @@ fine_tune() {
 }
 
 # Variables for cleaner handling
-BASE_DIR="/mnt/local_storage"
+BASE_DIR="/home/chendan/Desktop/workspace/workspace/checkpoints/test-trainer"
 DATA_DIR="./data"
 TRAIN_PATH="${DATA_DIR}/train.jsonl"
 TEST_PATH="${DATA_DIR}/test.jsonl"
@@ -70,8 +69,8 @@ done
 # Batch size and node count
 case $SIZE in
 "7b")
-    BS=16
-    ND=16
+    BS=8
+    ND=1
     ;;
 "13b")
     BS=16
