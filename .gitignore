@@ -1,3 +1,2 @@
-data
-dataset
-*.json*
+data/FashionMNIST/
+SQuAD_it*
